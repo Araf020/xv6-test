@@ -47,13 +47,13 @@ exec(char *path, char **argv)
       continue;
     if(ph.memsz < ph.filesz)
       goto bad;
-    if(ph.vaddr + ph.memsz < ph.vaddr)
+    if(ph.virtualAddress + ph.memsz < ph.virtualAddress)
       goto bad;
-    if((sz = allocuvm(pgdir, sz, ph.vaddr + ph.memsz)) == 0)
+    if((sz = allocuvm(pgdir, sz, ph.virtualAddress + ph.memsz)) == 0)
       goto bad;
-    if(ph.vaddr % PGSIZE != 0)
+    if(ph.virtualAddress % PGSIZE != 0)
       goto bad;
-    if(loaduvm(pgdir, (char*)ph.vaddr, ip, ph.off, ph.filesz) < 0)
+    if(loaduvm(pgdir, (char*)ph.virtualAddress, ip, ph.off, ph.filesz) < 0)
       goto bad;
   }
   iunlockput(ip);

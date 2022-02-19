@@ -192,6 +192,13 @@ inituvm(pde_t *pgdir, char *init, uint sz)
   memmove(mem, init, sz);
 }
 
+
+
+void updateQueueRear(struct proc *p) {
+  p->memoryQueue.rear = (p->memoryQueue.front + p->pc.memoryPagesCount);
+  p->memoryQueue.rear %=  MAX_PSYC_PAGES;
+}
+
 // Load a program segment into pgdir.  addr must be page-aligned
 // and the pages from addr to addr+sz must already be mapped.
 int
@@ -216,11 +223,50 @@ loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
   return 0;
 }
 
+static char buff[PGSIZE];
+
+int nextFreeMemoryPage(struct proc *p) {
+  if(p->pc.memoryPagesCount != MAX_PSYC_PAGES) return p->memoryQueue.rear;
+  return -1;
+}
+
+int nextFreeMemoryPageNFU(struct proc *p){
+  for (uint i = 0; i < MAX_PSYC_PAGES; i++)
+  {
+    if(!p->memoryNFU.memoryPages[i].isUsed) return i;
+  }
+  return -1;
+}
+
+void insertToMemoryNFU(struct proc *p, pde_t *pgdir, uint virtualAddress) {
+
+  int index;
+  index = nextFreeMemoryPageNFU(p);
+  p->pc.memoryPagesCount++;
+  p->memoryNFU.memoryPages[index].isUsed = 1;
+  p->memoryNFU.memoryPages[index].virtualAddress = virtualAddress;
+  p->memoryNFU.memoryPages[index].pgdir = pgdir;
+  p->memoryNFU.memoryPages[index].counter = 0;
+}
+
+void insertToMemory(struct proc *p, pde_t *pgdir, uint virtualAddress) {
+
+  int index;
+  index = nextFreeMemoryPage(p);
+  p->pc.memoryPagesCount++;
+  p->memoryQueue.memoryPages[index].isUsed = 1;
+  p->memoryQueue.memoryPages[index].virtualAddress = virtualAddress;
+  p->memoryQueue.memoryPages[index].pgdir = pgdir;
+  updateQueueRear(p);
+}
+
 // Allocate page tables and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 int
 allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
+  struct proc* p;
+  p = myproc();
   char *mem;
   uint a;
 
@@ -228,6 +274,13 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
     return 0;
   if(newsz < oldsz)
     return oldsz;
+
+  // If number of pages composing newsz exceeds MAX_TOTAL_PAGES and the current proc is NOT init or shell...
+  if (PGROUNDUP(newsz)/PGSIZE > MAX_TOTAL_PAGES) {
+  	if(isInit(p)==0){
+      return 0;
+    }
+  }
 
   a = PGROUNDUP(oldsz);
   for(; a < newsz; a += PGSIZE){
@@ -244,8 +297,73 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       kfree(mem);
       return 0;
     }
+    // If any policy is defined AND current proc is NOT init or shell...
+    if (isInit(p)==0){
+      if(!NFUPageReplacementAlgo){
+        if (p->pc.memoryPagesCount != MAX_PSYC_PAGES) insertToMemory(p, pgdir, a);
+	      else swapOut(p, pgdir, a);
+      }
+	    else{
+        if (p->pc.memoryPagesCount != MAX_PSYC_PAGES) insertToMemoryNFU(p, pgdir, a);
+	      else swapOutNFU(p, pgdir, a);
+      }
+    }
   }
   return newsz;
+}
+
+void reorderQueue(struct proc *p,int from) {
+  if (from < 0)
+    panic("called to organize queue with invalid args");
+  int i = from;
+  
+  for (int nextIdx = (from + 1) % MAX_PSYC_PAGES; ; ) { ;
+    if (p->memoryQueue.memoryPages[i].isUsed == 0) {
+      if(p->memoryQueue.memoryPages[nextIdx].isUsed == 1){
+        p->memoryQueue.memoryPages[i] = p->memoryQueue.memoryPages[nextIdx];
+        p->memoryQueue.memoryPages[nextIdx].isUsed = 0;
+        i = nextIdx;}
+    } 
+    else if (p->memoryQueue.memoryPages[i].isUsed == 1) i = nextIdx;
+
+    nextIdx = (nextIdx + 1) % MAX_PSYC_PAGES;
+    if(nextIdx == p->memoryQueue.rear)break;
+  }
+}
+
+
+void removeFromMemoryNFU(struct proc *p, uint virtualAddress, const pde_t *pgdir){
+
+  if (p){
+    int i;
+    for (i = 0; i < MAX_PSYC_PAGES; i++) {
+      if (p->memoryNFU.memoryPages[i].virtualAddress == virtualAddress)
+          if(p->memoryNFU.memoryPages[i].isUsed == 1)
+            if(p->memoryNFU.memoryPages[i].pgdir == pgdir){
+              p->memoryNFU.memoryPages[i].isUsed = 0;
+              p->memoryNFU.memoryPages[i].counter = 0;
+              p->pc.memoryPagesCount--;
+              return;
+            }
+    }
+  }
+}
+
+void removeFromMemory(struct proc *p, uint virtualAddress, const pde_t *pgdir){
+  if (p){
+    int i;
+    for (i = 0; i < MAX_PSYC_PAGES; i++) {
+      if (p->memoryQueue.memoryPages[i].virtualAddress == virtualAddress)
+          if(p->memoryQueue.memoryPages[i].isUsed == 1)
+            if(p->memoryQueue.memoryPages[i].pgdir == pgdir){
+              p->memoryQueue.memoryPages[i].isUsed = 0;
+              p->pc.memoryPagesCount--;
+              reorderQueue(p, i);
+              updateQueueRear(p);
+              return;
+            }
+    }
+  }
 }
 
 // Deallocate user pages to bring the process size from oldsz to
@@ -257,6 +375,11 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
   pte_t *pte;
   uint a, pa;
+  struct proc* p;
+  p = myproc();
+
+  if(p == 0)
+    return oldsz;
 
   if(newsz >= oldsz)
     return oldsz;
@@ -270,8 +393,14 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       pa = PTE_ADDR(*pte);
       if(pa == 0)
         panic("kfree");
-      char *v = P2V(pa);
+      char *v;
+      int notInitialProcs = (isInit(p)==0);
+      v = P2V(pa);
       kfree(v);
+      if (notInitialProcs){
+        if(!NFUPageReplacementAlgo) removeFromMemory(p, a, pgdir);
+        else removeFromMemoryNFU(p, a, pgdir);
+      }
       *pte = 0;
     }
   }
@@ -310,6 +439,48 @@ clearpteu(pde_t *pgdir, char *uva)
   *pte &= ~PTE_U;
 }
 
+void updateFlags(pte_t *pte, int isOut, int pagePAddr){
+  if(isOut==1){
+    *pte &= ~PTE_P;
+    *pte |= PTE_PG;                      
+    *pte &= PTE_FLAGS(*pte);
+  }
+
+  else if(isOut==0){
+    *pte &= ~PTE_PG;
+    *pte |= PTE_P | PTE_W | PTE_U;                           
+    *pte |= pagePAddr; 
+  }
+}
+
+void updateFlagsMemoryIn(struct proc* p, int virtualAddress, int pagePAddr, pde_t * pgdir){
+
+  pte_t *pte;
+  pte = walkpgdir(pgdir, (int*)virtualAddress, 0);
+
+  if (!pte)
+    panic("updateFlagsMemoryIn: pte does NOT exist in pgdir");
+
+  if (*pte & PTE_P)
+    panic("updateFlagsMemoryIn: page is already in memory!");
+
+  updateFlags(pte, 0, pagePAddr);
+
+  lcr3(V2P(p->pgdir)); //refresh CR3 register
+}
+
+void updateFlagsMemoryOut(struct proc* p, int virtualAddress, pde_t * pgdir){
+
+  pte_t *pte;
+  pte = walkpgdir(pgdir, (int*)virtualAddress, 0);
+  if (!pte)
+    panic("updateFlagsMemoryOut: pte does NOT exist in pgdir");
+
+  updateFlags(pte, 1, 0);
+
+  lcr3(V2P(p->pgdir));      // Refresh CR3 register
+}
+
 // Given a parent process's page table, create a copy
 // of it for a child.
 pde_t*
@@ -320,11 +491,19 @@ copyuvm(pde_t *pgdir, uint sz)
   uint pa, i, flags;
   char *mem;
 
+  struct proc* p;
+  p = myproc();
+  if(!p) return 0;
+
   if((d = setupkvm()) == 0)
     return 0;
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
+    if (*pte & PTE_PG){
+      updateFlagsMemoryOut(p, i, d);
+      continue;
+    }
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
     pa = PTE_ADDR(*pte);
@@ -389,6 +568,301 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
 // Blank page.
 //PAGEBREAK!
 // Blank page.
-//PAGEBREAK!
-// Blank page.
 
+int nextReplacableMemoryPage(struct proc *p){
+  return p->memoryQueue.front;
+}
+
+int nextReplacableMemoryPageNFU(struct proc *p){
+  uint i, min_ind = 0;
+  for (i = 0; i < MAX_PSYC_PAGES; i++)
+  {
+    if(!p->memoryNFU.memoryPages[i].isUsed) continue;
+    int min = p->memoryNFU.memoryPages[min_ind].counter;
+    int curr = p->memoryNFU.memoryPages[i].counter;
+    if(curr < min) min_ind = i;
+  }
+  return min_ind;
+}
+
+
+uint getPhysicalAddress(int virtualAddress, pde_t *pgdir){
+  pte_t* pte;
+  pte = walkpgdir(pgdir, (int*)virtualAddress, 0);
+  if(!pte){
+    return -1;
+  }
+  return PTE_ADDR(*pte);
+}
+
+
+
+int PageWasSwapped(struct proc *p, int virtualAddress) {
+  int va;
+  va = virtualAddress;
+  pte_t *pte = walkpgdir(p->pgdir, (char *)va, 0);
+  return (*pte & PTE_PG);
+}
+
+void shiftQueue(struct proc *p) {
+  p->memoryQueue.front = (p->memoryQueue.front+1)%MAX_PSYC_PAGES;
+  p->memoryQueue.rear = (p->memoryQueue.rear+1)%MAX_PSYC_PAGES;
+}
+
+int nextFreeSwapPage(struct proc *p) {
+  int i;
+  i=0;
+  while (i < MAX_FILE_PAGES)
+  {
+    if (p->swapPages[i].isUsed == 0)
+      return i;
+    i++;
+  }
+
+  return -1;
+}
+
+int pageToMemoryNFU(struct proc* p, int memoryIndex, uint virtualAddress, char* buff) {
+
+  int ret;
+  ret = -1;
+  int i = 0;
+  uint SwapVirtualAddress;
+  while (i < MAX_FILE_PAGES)
+  {
+    SwapVirtualAddress = p->swapPages[i].virtualAddress;
+    if (SwapVirtualAddress == virtualAddress) {
+      ret = readFromSwapFile(p, buff, i*PGSIZE, PGSIZE);
+      if (ret == -1)
+        break;
+      p->pc.swapFilePagesCount--;
+      p->memoryNFU.memoryPages[memoryIndex] = p->swapPages[i];
+      p->swapPages[i].isUsed = 0;
+      return ret;
+    }
+    i++;
+  }
+  
+  return -1;
+}
+
+int pageToMemory(struct proc* p, int memoryIndex, uint virtualAddress, char* buff) {
+
+  int ret;
+  ret = -1;
+  int i = 0;
+  uint SwapVirtualAddress;
+  while (i < MAX_FILE_PAGES)
+  {
+    SwapVirtualAddress = p->swapPages[i].virtualAddress;
+    if (SwapVirtualAddress == virtualAddress) {
+      ret = readFromSwapFile(p, buff, i*PGSIZE, PGSIZE);
+      if (ret == -1)
+        break;
+      p->pc.swapFilePagesCount--;
+      p->memoryQueue.memoryPages[memoryIndex] = p->swapPages[i];
+      p->swapPages[i].isUsed = 0;
+      return ret;
+    }
+    i++;
+  }
+  
+  return -1;
+}
+
+
+int pageToSwap(struct proc * p, uint virtualAddress, pde_t *pgdir) {
+  
+  int index;
+  index = nextFreeSwapPage(p);
+  
+  if(index==-1) return -1;
+
+  if(writeToSwapFile(p, (char*)virtualAddress, PGSIZE*index, PGSIZE) == -1)
+    return -1;
+  
+  
+  p->swapPages[index].isUsed = 1;
+  p->pc.swapFilePagesCount++;
+  p->swapPages[index].virtualAddress = virtualAddress;
+  p->swapPages[index].pgdir = pgdir;
+  
+  
+
+  return index;
+}
+
+void swapOutNFU(struct proc *p, pde_t *pgdir, uint virtualAddress){
+
+  // Get the page index to replace according to replacement algorithm
+  int replace_index;
+  struct page_t swappedPage;
+  uint pagePhysicalAddress;
+  char *va;
+  replace_index = nextReplacableMemoryPageNFU(p);
+  swappedPage = p->memoryNFU.memoryPages[replace_index];
+  pagePhysicalAddress = getPhysicalAddress(p->memoryNFU.memoryPages[replace_index].virtualAddress, p->memoryNFU.memoryPages[replace_index].pgdir);
+  va = (char*)P2V(pagePhysicalAddress);
+
+  // write the selected page from memory to swap and free that page in memory
+  pageToSwap(p, p->memoryNFU.memoryPages[replace_index].virtualAddress, p->memoryNFU.memoryPages[replace_index].pgdir);
+
+  kfree(va);
+  // Update Flags in memory
+  updateFlagsMemoryOut(p, swappedPage.virtualAddress, swappedPage.pgdir);
+
+  // states and counter update
+  p->memoryNFU.memoryPages[replace_index].isUsed = 0;
+  p->pc.memoryPagesCount--;
+
+  // Finds queue rear and inserts new page there
+  insertToMemoryNFU(p, pgdir, virtualAddress);
+}
+
+
+void swapOut(struct proc *p, pde_t *pgdir, uint virtualAddress){
+
+  // Get the page index to replace according to replacement algorithm
+  int replace_index;
+  struct page_t swappedPage;
+  uint pagePhysicalAddress;
+  char *va;
+  replace_index = nextReplacableMemoryPage(p);
+  swappedPage = p->memoryQueue.memoryPages[replace_index];
+  pagePhysicalAddress = getPhysicalAddress(p->memoryQueue.memoryPages[replace_index].virtualAddress, p->memoryQueue.memoryPages[replace_index].pgdir);
+  va = (char*)P2V(pagePhysicalAddress);
+
+  // write the selected page from memory to swap and free that page in memory
+  pageToSwap(p, p->memoryQueue.memoryPages[replace_index].virtualAddress, p->memoryQueue.memoryPages[replace_index].pgdir);
+
+  kfree(va);
+  // Update Flags in memory
+  updateFlagsMemoryOut(p, swappedPage.virtualAddress, swappedPage.pgdir);
+
+  // states and counter update
+  p->memoryQueue.memoryPages[replace_index].isUsed = 0;
+  p->pc.memoryPagesCount--;
+
+  // Finds queue rear and inserts new page there
+  insertToMemory(p, pgdir, virtualAddress);
+  shiftQueue(p);
+}
+
+
+int swapIn(struct proc* p, int page_index){
+  if(!NFUPageReplacementAlgo){
+    // This function is called from trap when page fault occurs
+    p->pc.pageFaultCount++;
+
+    //Allocating space for new page
+    char* new_allocated_page = kalloc();
+    memset(new_allocated_page, 0, PGSIZE);
+    lcr3(V2P(p->pgdir));
+    int AvailableMemoryIndex = nextFreeMemoryPage(p);
+    
+
+    uint virtualAddress = PGROUNDDOWN(page_index);
+    // If there is available space in ram no need to swap out
+    if (AvailableMemoryIndex >= 0) {
+      cprintf("Free index FIFO= %d\n",AvailableMemoryIndex);
+      updateFlagsMemoryIn(p, virtualAddress, V2P(new_allocated_page), p->pgdir);
+      pageToMemory(p, AvailableMemoryIndex, virtualAddress, (char*)virtualAddress);
+      return 1;
+    }
+
+
+    //Swapping-out is needed, Much like swapout
+    // Find the available page space in swapfile and return its index in array
+    struct page_t outPage;
+    int outPagePAddr;
+    char *v;
+
+    AvailableMemoryIndex = nextReplacableMemoryPage(p);
+    outPage = p->memoryQueue.memoryPages[AvailableMemoryIndex];
+    outPagePAddr = getPhysicalAddress(outPage.virtualAddress, outPage.pgdir);
+    v = (char*)P2V(outPagePAddr);
+
+    cprintf("Replacable index FIFO= %d\n",AvailableMemoryIndex);
+    updateFlagsMemoryIn(p, virtualAddress, V2P(new_allocated_page), p->pgdir);
+    pageToMemory(p, AvailableMemoryIndex, virtualAddress, buff);
+
+    memmove(new_allocated_page, buff, PGSIZE);
+
+    pageToSwap(p, outPage.virtualAddress, outPage.pgdir);
+    updateFlagsMemoryOut(p, outPage.virtualAddress, outPage.pgdir);
+
+    kfree(v);
+    shiftQueue(p);
+    return 1;
+    }
+
+  else
+  {
+    // This function is called from trap when page fault occurs
+    p->pc.pageFaultCount++;
+
+    //Allocating space for new page
+    char* new_allocated_page = kalloc();
+    memset(new_allocated_page, 0, PGSIZE);
+    lcr3(V2P(p->pgdir));
+    int AvailableMemoryIndex = nextFreeMemoryPageNFU(p);
+    
+
+    uint virtualAddress = PGROUNDDOWN(page_index);
+    // If there is available space in ram no need to swap out
+    if (AvailableMemoryIndex >= 0) {
+      cprintf("Free index NFU= %d\n",AvailableMemoryIndex);
+      updateFlagsMemoryIn(p, virtualAddress, V2P(new_allocated_page), p->pgdir);
+      pageToMemoryNFU(p, AvailableMemoryIndex, virtualAddress, (char*)virtualAddress);
+      return 1;
+    }
+
+
+    //Swapping-out is needed, Much like swapout
+    // Find the available page space in swapfile and return its index in array
+    struct page_t outPage;
+    int outPagePAddr;
+    char *v;
+
+    AvailableMemoryIndex = nextReplacableMemoryPageNFU(p);
+    outPage = p->memoryNFU.memoryPages[AvailableMemoryIndex];
+    outPagePAddr = getPhysicalAddress(outPage.virtualAddress, outPage.pgdir);
+    v = (char*)P2V(outPagePAddr);
+
+    cprintf("Replacable index NFU= %d\n",AvailableMemoryIndex);
+    updateFlagsMemoryIn(p, virtualAddress, V2P(new_allocated_page), p->pgdir);
+    pageToMemoryNFU(p, AvailableMemoryIndex, virtualAddress, buff);
+
+    memmove(new_allocated_page, buff, PGSIZE);
+
+    pageToSwap(p, outPage.virtualAddress, outPage.pgdir);
+    updateFlagsMemoryOut(p, outPage.virtualAddress, outPage.pgdir);
+
+    kfree(v);
+    return 1;
+  }
+  
+}
+
+void updateCounters(struct proc* p){
+  if(!NFUPageReplacementAlgo) panic("Wrong algo");
+
+  for (uint i = 0; i < MAX_PSYC_PAGES; i++)
+  {
+    if(!p->memoryNFU.memoryPages[i].isUsed) continue;
+    uint virtualAddress = p->memoryNFU.memoryPages[i].virtualAddress;
+    pte_t* pte = walkpgdir(p->memoryNFU.memoryPages[i].pgdir, (char*) virtualAddress, 0);
+    
+    if(!pte) panic("NULL");
+    if (*pte & PTE_PG){
+      p->memoryNFU.memoryPages[i].counter=0;
+      continue;
+    }
+    if (*pte & PTE_A){
+       p->memoryNFU.memoryPages[i].counter++;
+       *pte &= ~PTE_A;
+    }
+    lcr3(V2P(p->pgdir));    
+  }
+  
+}

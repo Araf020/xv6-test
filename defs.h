@@ -52,6 +52,11 @@ struct inode*   nameiparent(char*, char*);
 int             readi(struct inode*, char*, uint, uint);
 void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, char*, uint, uint);
+int             createSwapFile(struct proc* p);
+int             readFromSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size);
+int             writeToSwapFile(struct proc* p, char* buffer, uint placeOnFile, uint size);
+int             removeSwapFile(struct proc* p);
+
 
 // ide.c
 void            ideinit(void);
@@ -120,9 +125,15 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
+int  			isInit(struct proc* p);
 
 // swtch.S
 void            swtch(struct context**, struct context*);
+
+// sysfile
+struct inode*   create(char *path, short type, short major, short minor);
+int             isdirempty(struct inode *dp);
+
 
 // spinlock.c
 void            acquire(struct spinlock*);
@@ -186,5 +197,12 @@ void            switchkvm(void);
 int             copyout(pde_t*, uint, void*, uint);
 void            clearpteu(pde_t *pgdir, char *uva);
 
+int 			swapIn(struct proc* p, int cr2);
+void 			swapOut(struct proc *p, pde_t *pgdir, uint virtualAddress);
+void 			swapOutNFU(struct proc *p, pde_t *pgdir, uint virtualAddress);
+int 			PageWasSwapped(struct proc *p, int virtualAddress);
+void            updateCounters(struct proc* p);
+
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+#define NFUPageReplacementAlgo 1 //0 for fifo, 1 for NFU

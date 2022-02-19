@@ -48,6 +48,7 @@ trap(struct trapframe *tf)
 
   switch(tf->trapno){
   case T_IRQ0 + IRQ_TIMER:
+    if(myproc() && NFUPageReplacementAlgo && isInit(myproc())) updateCounters(myproc());
     if(cpuid() == 0){
       acquire(&tickslock);
       ticks++;
@@ -78,6 +79,15 @@ trap(struct trapframe *tf)
     lapiceoi();
     break;
 
+  
+  case T_PGFLT: {
+	  if ((isInit(myproc())==0) && (tf->cs & 3) == 3) {
+      if(PageWasSwapped(myproc(), rcr2()) != 0)
+        if(swapIn(myproc(), rcr2()))
+		      break;
+	  }
+	  
+  }
   //PAGEBREAK: 13
   default:
     if(myproc() == 0 || (tf->cs&3) == 0){

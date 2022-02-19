@@ -25,7 +25,7 @@ struct elfhdr {
 struct proghdr {
   uint type;
   uint off;
-  uint vaddr;
+  uint virtualAddress;
   uint paddr;
   uint filesz;
   uint memsz;

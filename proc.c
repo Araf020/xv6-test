@@ -65,6 +65,16 @@ myproc(void) {
   return p;
 }
 
+void initializeSwap(struct proc *p){
+
+  if(isInit(p)==0){
+    int i;
+    for(i=0; i < MAX_FILE_PAGES; i++)
+    p->swapPages[i].isUsed = 0;
+    }
+
+}
+
 //PAGEBREAK: 32
 // Look in the process table for an UNUSED proc.
 // If found, change state to EMBRYO and initialize
@@ -101,6 +111,22 @@ found:
   // Leave room for trap frame.
   sp -= sizeof *p->tf;
   p->tf = (struct trapframe*)sp;
+
+  p->memoryQueue.front=0;
+  p->memoryQueue.rear=0;
+  p->pc.pageFaultCount = 0;
+  p->pc.swapFilePagesCount = 0;
+  p->pc.memoryPagesCount = 0;
+  
+  for (int i = 0; i==MAX_PSYC_PAGES ; i++){
+      p->memoryNFU.memoryPages[i].counter = 0;
+    }
+
+  if(isInit(p)==0){
+    createSwapFile(p);
+  }
+    
+	initializeSwap(p);
 
   // Set up new context to start executing at forkret,
   // which returns to trapret.
@@ -174,6 +200,32 @@ growproc(int n)
   return 0;
 }
 
+void cloneFile(struct proc* src, struct proc* dest){
+  char buffer[PGSIZE];
+  if (isInit(src)==0)
+  {
+    for (int i=0; i < MAX_FILE_PAGES; i++){
+      if (src->swapPages[i].isUsed == 1){
+        if (readFromSwapFile(src, buffer, PGSIZE*i, PGSIZE) != PGSIZE)
+          panic("cloneFile: error in reading from file");
+        
+        int wait = 0;
+        for (uint j = 0; j < PGSIZE; j++)
+        {
+          wait = 0;
+        }
+
+        if (writeToSwapFile(dest, buffer, PGSIZE*i, PGSIZE) != PGSIZE)
+          panic("cloneFile: error in writing to file");
+
+        i+=wait;
+
+        dest->swapPages[i].isUsed = 1;
+      }
+    }
+  }
+}
+
 // Create a new process copying p as the parent.
 // Sets up stack to return as if from system call.
 // Caller must set state of returned proc to RUNNABLE.
@@ -197,6 +249,27 @@ fork(void)
     return -1;
   }
   np->sz = curproc->sz;
+
+  if (isInit(curproc)==0){
+    cloneFile(curproc, np);
+    for (i = 0; ; ){
+      np->memoryQueue.memoryPages[i] = curproc->memoryQueue.memoryPages[i];
+      np->memoryQueue.memoryPages[i].pgdir = np->pgdir;
+      np->memoryNFU.memoryPages[i] = curproc->memoryNFU.memoryPages[i];
+      np->memoryNFU.memoryPages[i].pgdir = np->pgdir;
+      np->memoryNFU.memoryPages[i].counter = 0;
+      i++;
+      if(i==MAX_PSYC_PAGES) break;
+    }
+    for (i = 0; ; ){
+      np->swapPages[i] = curproc->swapPages[i];
+      np->swapPages[i].pgdir = np->pgdir;
+      i++;
+      if(i==MAX_FILE_PAGES) break;
+    }
+  }
+
+
   np->parent = curproc;
   *np->tf = *curproc->tf;
 
@@ -221,6 +294,29 @@ fork(void)
   return pid;
 }
 
+void removeProcFilePages(struct proc* p){
+  p->memoryQueue.front=0;
+	p->memoryQueue.rear=0;
+	p->pc.memoryPagesCount = 0;
+	p->sz = 0;
+  int i;
+	for (i = 0; ; ) {
+		p->memoryQueue.memoryPages[i].isUsed=0;
+		p->memoryQueue.memoryPages[i].virtualAddress=0xffffffff;
+    p->memoryNFU.memoryPages[i].isUsed=0;
+		p->memoryNFU.memoryPages[i].virtualAddress=0xffffffff;
+    p->memoryNFU.memoryPages[i].counter = 0;
+    i++;
+    if(i==MAX_PSYC_PAGES) break;
+	}
+	for (i = 0; ; ) {
+		p->swapPages[i].isUsed=0;
+		p->swapPages[i].virtualAddress=0xffffffff;
+    i++;
+    if(i==MAX_PSYC_PAGES) break;
+	}
+}
+
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait() to find out it exited.
@@ -240,6 +336,12 @@ exit(void)
       fileclose(curproc->ofile[fd]);
       curproc->ofile[fd] = 0;
     }
+  }
+
+  if(isInit(curproc)==0){
+    if (removeSwapFile(curproc) != 0)
+      panic("exit: error deleting swap file");
+    removeProcFilePages(curproc);
   }
 
   begin_op();
@@ -294,7 +396,7 @@ wait(void)
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;
-        p->state = UNUSED;
+        p->state = UNUSED;     
         release(&ptable.lock);
         return pid;
       }
@@ -529,6 +631,85 @@ procdump(void)
       for(i=0; i<10 && pc[i] != 0; i++)
         cprintf(" %p", pc[i]);
     }
-    cprintf("\n");
+    cprintf("\nPage Tables:");
+
+    pde_t* curr_pgdir = p->pgdir;
+    
+    cprintf("\n\tmemory location of page directory = %d", *curr_pgdir);
+
+    
+    for (int i = 0; i < 30; i++)
+    {
+      /* Page Directory Traversal */
+
+      pde_t *pde;
+      pte_t *pgtab;
+
+      if(curr_pgdir[i] & PTE_P){
+        pde = &curr_pgdir[i];
+        pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+        uint ppn = curr_pgdir[i] >> 12;
+        uint mem_loc = ppn << 12;
+        cprintf("\n\tpdir PTE  %d, %d", i, ppn);
+        cprintf("\n\t\tmemory location of page table = %d\n", mem_loc);
+
+        // int virtual_pn[1024];
+        // int physical_pn[1024];
+        // int cnt=0;
+
+        for (int j = 0; j < 1024; j++)
+        {
+          /* Page Table Traversal */
+          
+          if((pgtab[j] & PTE_P) && (pgtab[j] & PTE_U)){
+            uint ppn_ptble = pgtab[j] >> 12;
+            uint ppn_mem_loc = ppn_ptble << 12;
+            cprintf("\t\tptbl PTE  %d, %d, %d\n", j, ppn_ptble, ppn_mem_loc);
+            // virtual_pn[cnt] = j;
+            // physical_pn[cnt++] = ppn_ptble;
+          }
+        }
+
+        cprintf("\n\t\tPage mappings:\n");
+
+        // for (int j = 0; j < cnt; j++)
+        // {
+        //   /* Print Mapping */
+        //   cprintf("\n\t\t%d -> %d",virtual_pn[j], physical_pn[j]);
+        // }
+
+        for (int j = 0; j < 1024; j++)
+        {
+          /* Page Table Traversal */
+          
+          if((pgtab[j] & PTE_P) && (pgtab[j] & PTE_U)){
+            uint ppn_ptble = pgtab[j] >> 12;
+            uint ppn_mem_loc = ppn_ptble << 12;
+            cprintf("\t\t%d -> %d\n", ppn_ptble, ppn_mem_loc);
+            // virtual_pn[cnt] = j;
+            // physical_pn[cnt++] = ppn_ptble;
+          }
+        }
+        
+      } 
+
+    }
   }
 }
+
+int
+isInit(struct proc* p){
+  if(!p) return 1;
+  if(p){
+    if(p->pid <= 1){
+      return 1;
+    }
+  }
+	return 0;
+}
+
+
+
+
+
+
